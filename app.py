@@ -7,6 +7,9 @@ from dlclive import DLCLive, Processor
 from collections import deque
 from scipy.signal import savgol_filter
 from filterpy.kalman import KalmanFilter
+from streamlit_webrtc import webrtc_streamer, VideoProcessorBase, RTCConfiguration
+import av
+import threading
 
 # --- CONFIGURACIÓN DE INTERFAZ ---
 st.set_page_config(page_title="Monitor Cairo AI - UNAP", layout="wide")
@@ -103,10 +106,8 @@ st.markdown("""
 """, unsafe_allow_html=True)
 
 # RUTA DEL MODELO DLC
-
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 PATH_MODELO = os.path.join(BASE_DIR, "exported-models", "DLC_DAPS_Protocol_efficientnet-b0_iteration-1_shuffle-1")
-
 
 # --- CLASE PARA FILTRADO KALMAN ---
 class KalmanPointTracker:
@@ -234,19 +235,60 @@ modelo_ai = cargar_modelo()
 st.sidebar.markdown("---")
 st.sidebar.markdown("### 📹 Fuente de Entrada")
 modo = st.sidebar.radio("Selecciona Fuente:", ("Cámara Live", "Subir Video"))
-video_path = None
 
-if modo == "Cámara Live":
-    video_path = 0
-else:
-    f = st.file_uploader("Sube el video de Cairo", type=["mp4", "mov", "avi"])
-    if f:
-        tfile = tempfile.NamedTemporaryFile(delete=False, suffix='.mp4')
-        tfile.write(f.read())
-        video_path = tfile.name
+# Variables compartidas para WebRTC
+if 'estado_actual' not in st.session_state:
+    st.session_state.estado_actual = "ESPERANDO..."
+if 'metricas_actuales' not in st.session_state:
+    st.session_state.metricas_actuales = {"Asimetría": "0°", "Energía": "0", "Acel": "0"}
+if 'pose_actual' not in st.session_state:
+    st.session_state.pose_actual = None
 
-# --- FUNCIÓN DE PROCESAMIENTO ---
-def run(path):
+# --- CLASE VIDEO PROCESSOR PARA WEBRTC ---
+class CairoVideoProcessor(VideoProcessorBase):
+    def __init__(self):
+        self.analizador = AnalizadorBiomecanicoCairo(confidence_threshold=conf_dlc)
+        self.esqueleto = [(0,2),(2,3),(3,4),(2,5),(5,6),(6,7),(2,8),(8,9),(9,10),(3,11),(11,12),(12,13),(3,14),(14,15),(15,16)]
+        self.lock = threading.Lock()
+        
+    def recv(self, frame):
+        img = frame.to_ndarray(format="bgr24")
+        
+        if modelo_ai is None:
+            return av.VideoFrame.from_ndarray(img, format="bgr24")
+        
+        try:
+            # Inferencia
+            raw = modelo_ai.get_pose(img)
+            pose = self.analizador.filtrar_confianza(raw)
+            estado, color, met = self.analizador.analizar_estado(
+                pose, 
+                (u_suelo, u_cojera, u_reposo, u_sentado, u_juego, 6)
+            )
+            
+            # Actualizar estado global
+            with self.lock:
+                st.session_state.estado_actual = estado
+                st.session_state.metricas_actuales = met
+                st.session_state.pose_actual = pose
+            
+            # Renderizado
+            cv2.rectangle(img, (10,10), (550,90), (0,0,0), -1)
+            cv2.putText(img, estado, (25,55), cv2.FONT_HERSHEY_SIMPLEX, 1, color, 3)
+            
+            for c in self.esqueleto:
+                p1, p2 = pose[c[0]], pose[c[1]]
+                cv2.line(img, (int(p1[0]), int(p1[1])), (int(p2[0]), int(p2[1])), (255,255,255), 2)
+            for p in pose:
+                cv2.circle(img, (int(p[0]), int(p[1])), 5, (0,255,0) if p[2]>conf_dlc else (0,165,255), -1)
+                
+        except Exception as e:
+            cv2.putText(img, f"Error: {str(e)[:30]}", (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0,0,255), 2)
+        
+        return av.VideoFrame.from_ndarray(img, format="bgr24")
+
+# --- FUNCIÓN DE PROCESAMIENTO VIDEO ---
+def run_video(path):
     if modelo_ai is None:
         st.error("Modelo no cargado.")
         return
@@ -254,26 +296,22 @@ def run(path):
     cap = cv2.VideoCapture(path)
     
     if not cap.isOpened():
-        st.error("No se pudo acceder a la cámara/video. Verifica los permisos.")
+        st.error("No se pudo acceder al video.")
         return
 
-    # Crear dos columnas: Video (más grande) y Control (más pequeño)
     col_video, col_control = st.columns([1.5, 1])
     
     analizador = AnalizadorBiomecanicoCairo(confidence_threshold=conf_dlc)
     esqueleto = [(0,2),(2,3),(3,4),(2,5),(5,6),(6,7),(2,8),(8,9),(9,10),(3,11),(11,12),(12,13),(3,14),(14,15),(15,16)]
 
-    # Botón para detener
     col_btn_left, col_btn_right = st.columns([1.5, 1])
     with col_btn_left:
         stop = st.button("⏹️ Detener Procesamiento", use_container_width=True, key="btn_stop")
 
-    # Contenedores en columna izquierda (VIDEO - MÁS GRANDE)
     with col_video:
         st.markdown("### 🎥 Transmisión en Vivo")
         st_frame = st.empty()
     
-    # Contenedores en columna derecha (CONTROL Y MÉTRICAS)
     with col_control:
         st_estado = st.empty()
         st_met = st.empty()
@@ -283,12 +321,10 @@ def run(path):
         ret, frame = cap.read()
         if not ret: break
         
-        # Inferencia
         raw = modelo_ai.get_pose(frame)
         pose = analizador.filtrar_confianza(raw)
         estado, color, met = analizador.analizar_estado(pose, (u_suelo, u_cojera, u_reposo, u_sentado, u_juego, 6))
         
-        # Renderizado
         cv2.rectangle(frame, (10,10), (550,90), (0,0,0), -1)
         cv2.putText(frame, estado, (25,55), cv2.FONT_HERSHEY_SIMPLEX, 1, color, 3)
         
@@ -298,13 +334,10 @@ def run(path):
         for p in pose:
             cv2.circle(frame, (int(p[0]), int(p[1])), 5, (0,255,0) if p[2]>conf_dlc else (0,165,255), -1)
 
-        # VIDEO EN COLUMNA IZQUIERDA (MÁS GRANDE)
         with col_video:
             st_frame.image(frame, channels="BGR", use_container_width=True)
         
-        # PANEL DE CONTROL EN COLUMNA DERECHA (CON MEJOR ESPACIADO)
         with col_control:
-            # Estado con más espacio
             st_estado.markdown(f"""
             <div class="estado-card">
                 {estado}
@@ -313,12 +346,10 @@ def run(path):
             
             st.markdown('<div style="margin: 20px 0;"></div>', unsafe_allow_html=True)
             
-            # Mostrar métricas con mejor diseño y espaciado
             with st_met.container():
                 st.markdown("#### 🔍 Métricas")
                 st.markdown('<div style="margin: 10px 0;"></div>', unsafe_allow_html=True)
                 
-                # Métrica 1: Asimetría
                 st.markdown(f"""
                 <div class="metric-card">
                     <div style="font-size: 22px; margin-bottom: 10px;">📐</div>
@@ -329,7 +360,6 @@ def run(path):
                 
                 st.markdown('<div style="margin: 12px 0;"></div>', unsafe_allow_html=True)
                 
-                # Métrica 2: Energía
                 st.markdown(f"""
                 <div class="metric-card">
                     <div style="font-size: 22px; margin-bottom: 10px;">⚡</div>
@@ -340,7 +370,6 @@ def run(path):
                 
                 st.markdown('<div style="margin: 12px 0;"></div>', unsafe_allow_html=True)
                 
-                # Métrica 3: Aceleración
                 st.markdown(f"""
                 <div class="metric-card">
                     <div style="font-size: 22px; margin-bottom: 10px;">🚀</div>
@@ -353,7 +382,6 @@ def run(path):
             st.markdown('<div class="divider-custom"></div>', unsafe_allow_html=True)
             st.markdown('<div style="margin: 20px 0;"></div>', unsafe_allow_html=True)
             
-            # Información de pose
             with st_info.container():
                 st.markdown("#### 🦴 Posición")
                 st.markdown('<div style="margin: 10px 0;"></div>', unsafe_allow_html=True)
@@ -377,14 +405,116 @@ def run(path):
                 """, unsafe_allow_html=True)
 
     cap.release()
-    if modo == "Subir Video" and path:
+    if path:
         os.unlink(path)
 
-# --- BOTÓN DE INICIO ---
-if video_path is not None:
-    col_btn1, col_btn2, col_btn3 = st.columns([1, 1, 1])
-    with col_btn2:
-        if st.button("🚀 INICIAR PROCESAMIENTO", use_container_width=True, key="btn_start"):
-            run(video_path)
+# --- INTERFAZ PRINCIPAL ---
+if modo == "Cámara Live":
+    # Configuración RTC para mejor compatibilidad
+    RTC_CONFIGURATION = RTCConfiguration(
+        {"iceServers": [{"urls": ["stun:stun.l.google.com:19302"]}]}
+    )
+    
+    col_video, col_control = st.columns([1.5, 1])
+    
+    with col_video:
+        st.markdown("### 🎥 Transmisión en Vivo")
+        webrtc_ctx = webrtc_streamer(
+            key="cairo-monitor",
+            video_processor_factory=CairoVideoProcessor,
+            rtc_configuration=RTC_CONFIGURATION,
+            media_stream_constraints={"video": True, "audio": False},
+            async_processing=True,
+        )
+    
+    with col_control:
+        st_estado = st.empty()
+        st_met = st.empty()
+        st_info = st.empty()
+        
+        # Actualizar interfaz cada segundo
+        if webrtc_ctx.state.playing:
+            estado = st.session_state.estado_actual
+            met = st.session_state.metricas_actuales
+            pose = st.session_state.pose_actual
+            
+            st_estado.markdown(f"""
+            <div class="estado-card">
+                {estado}
+            </div>
+            """, unsafe_allow_html=True)
+            
+            st.markdown('<div style="margin: 20px 0;"></div>', unsafe_allow_html=True)
+            
+            with st_met.container():
+                st.markdown("#### 🔍 Métricas")
+                st.markdown('<div style="margin: 10px 0;"></div>', unsafe_allow_html=True)
+                
+                st.markdown(f"""
+                <div class="metric-card">
+                    <div style="font-size: 22px; margin-bottom: 10px;">📐</div>
+                    <div style="font-size: 20px; font-weight: bold; margin-bottom: 5px;">{met.get("Asimetría", "0°")}</div>
+                    <div style="font-size: 13px; color: rgba(255,255,255,0.9);">Asimetría</div>
+                </div>
+                """, unsafe_allow_html=True)
+                
+                st.markdown('<div style="margin: 12px 0;"></div>', unsafe_allow_html=True)
+                
+                st.markdown(f"""
+                <div class="metric-card">
+                    <div style="font-size: 22px; margin-bottom: 10px;">⚡</div>
+                    <div style="font-size: 20px; font-weight: bold; margin-bottom: 5px;">{met.get("Energía", "0")}</div>
+                    <div style="font-size: 13px; color: rgba(255,255,255,0.9);">Energía Cinética</div>
+                </div>
+                """, unsafe_allow_html=True)
+                
+                st.markdown('<div style="margin: 12px 0;"></div>', unsafe_allow_html=True)
+                
+                st.markdown(f"""
+                <div class="metric-card">
+                    <div style="font-size: 22px; margin-bottom: 10px;">🚀</div>
+                    <div style="font-size: 20px; font-weight: bold; margin-bottom: 5px;">{met.get("Acel", "0")}</div>
+                    <div style="font-size: 13px; color: rgba(255,255,255,0.9);">Aceleración</div>
+                </div>
+                """, unsafe_allow_html=True)
+            
+            st.markdown('<div style="margin: 20px 0;"></div>', unsafe_allow_html=True)
+            st.markdown('<div class="divider-custom"></div>', unsafe_allow_html=True)
+            st.markdown('<div style="margin: 20px 0;"></div>', unsafe_allow_html=True)
+            
+            with st_info.container():
+                st.markdown("#### 🦴 Posición")
+                st.markdown('<div style="margin: 10px 0;"></div>', unsafe_allow_html=True)
+                if pose:
+                    st.markdown(f"""
+                    <div class="pose-info">
+                        <div style="margin-bottom: 10px;"><strong>👃 Nariz:</strong> ({pose[0][0]:.0f}, {pose[0][1]:.0f})</div>
+                        <div style="margin-bottom: 10px;"><strong>💪 Pecho:</strong> ({pose[2][0]:.0f}, {pose[2][1]:.0f})</div>
+                        <div><strong>🦴 Cadera:</strong> ({pose[3][0]:.0f}, {pose[3][1]:.0f})</div>
+                    </div>
+                    """, unsafe_allow_html=True)
+                
+                st.markdown('<div style="margin: 15px 0;"></div>', unsafe_allow_html=True)
+                
+                st.markdown("#### ⚙️ Configuración")
+                st.markdown('<div style="margin: 8px 0;"></div>', unsafe_allow_html=True)
+                st.markdown(f"""
+                <div class="info-box">
+                    <div style="margin-bottom: 6px;">✅ <strong>Confianza:</strong> {conf_dlc:.2f}</div>
+                    <div>⚡ <strong>Energía:</strong> {u_juego:.1f}</div>
+                </div>
+                """, unsafe_allow_html=True)
+
 else:
-    st.info("👆 Selecciona una fuente de video en el panel lateral para comenzar")
+    f = st.file_uploader("Sube el video de Cairo", type=["mp4", "mov", "avi"])
+    if f:
+        tfile = tempfile.NamedTemporaryFile(delete=False, suffix='.mp4')
+        tfile.write(f.read())
+        video_path = tfile.name
+        
+        col_btn1, col_btn2, col_btn3 = st.columns([1, 1, 1])
+        with col_btn2:
+            if st.button("🚀 INICIAR PROCESAMIENTO", use_container_width=True, key="btn_start"):
+                run_video(video_path)
+    else:
+        st.info("👆 Sube un video para comenzar el análisis")
