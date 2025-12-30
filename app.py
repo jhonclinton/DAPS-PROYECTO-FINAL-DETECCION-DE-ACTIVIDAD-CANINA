@@ -15,7 +15,6 @@ os.environ['CUDA_VISIBLE_DEVICES'] = '-1' # Desactiva GPU
 os.environ['TF_CPP_MIN_LOG_LEVEL'] = '3'  # Elimina avisos innecesarios
 os.environ['TF_FORCE_GPU_ALLOW_GROWTH'] = 'false'
 
-# --- CONFIGURACIÓN DE INTERFAZ ---
 st.set_page_config(page_title="Monitor Cairo AI - UNAP", layout="wide")
 
 # --- ESTILOS CSS PERSONALIZADOS ---
@@ -260,6 +259,9 @@ class CairoVideoProcessor(VideoProcessorBase):
     def recv(self, frame):
         img = frame.to_ndarray(format="bgr24")
         
+        # Debug visual
+        cv2.putText(img, "PROCESANDO...", (10, 100), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 0), 2)
+        
         # Inicializar analizador en el primer frame
         if self.analizador is None:
             self.analizador = AnalizadorBiomecanicoCairo(confidence_threshold=conf_dlc)
@@ -271,53 +273,63 @@ class CairoVideoProcessor(VideoProcessorBase):
         self.frame_count += 1
         
         try:
+            # Reducir resolución para CPU (IMPORTANTE EN STREAMLIT CLOUD)
+            img_small = cv2.resize(img, (640, 480))
+            
             # Convertir imagen a RGB para DLC
-            img_rgb = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
+            img_rgb = cv2.cvtColor(img_small, cv2.COLOR_BGR2RGB)
             
-            # Inferencia
-            raw = self.modelo.get_pose(img_rgb)
-            
-            # Verificar que raw tenga datos válidos
-            if raw is None or len(raw) == 0:
-                cv2.putText(img, "Sin deteccion", (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0,255,255), 2)
-                return av.VideoFrame.from_ndarray(img, format="bgr24")
-            
-            pose = self.analizador.filtrar_confianza(raw)
-            estado, color, met = self.analizador.analizar_estado(
-                pose, 
-                (u_suelo, u_cojera, u_reposo, u_sentado, u_juego, 6)
-            )
-            
-            # Actualizar estado global
-            with self.lock:
-                st.session_state.estado_actual = estado
-                st.session_state.metricas_actuales = met
-                st.session_state.pose_actual = pose
-            
-            # Renderizado
-            cv2.rectangle(img, (10,10), (550,90), (0,0,0), -1)
-            cv2.putText(img, estado, (25,55), cv2.FONT_HERSHEY_SIMPLEX, 1, color, 3)
-            
-            # Dibujar esqueleto
-            for c in self.esqueleto:
-                if c[0] < len(pose) and c[1] < len(pose):
-                    p1, p2 = pose[c[0]], pose[c[1]]
-                    if p1[2] > conf_dlc and p2[2] > conf_dlc:  # Solo dibujar si ambos puntos tienen buena confianza
-                        cv2.line(img, (int(p1[0]), int(p1[1])), (int(p2[0]), int(p2[1])), (255,255,255), 2)
-            
-            # Dibujar puntos
-            for idx, p in enumerate(pose):
-                if 0 <= p[0] < img.shape[1] and 0 <= p[1] < img.shape[0]:  # Verificar que esté dentro de la imagen
-                    color_punto = (0,255,0) if p[2]>conf_dlc else (0,165,255)
-                    cv2.circle(img, (int(p[0]), int(p[1])), 5, color_punto, -1)
-            
-            # Mostrar FPS
-            cv2.putText(img, f"Frame: {self.frame_count}", (10, img.shape[0]-10), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255,255,255), 1)
+            # Inferencia (cada 2 frames para reducir carga)
+            if self.frame_count % 2 == 0:
+                raw = self.modelo.get_pose(img_rgb)
+                
+                # Verificar que raw tenga datos válidos
+                if raw is None or len(raw) == 0:
+                    cv2.putText(img, "Sin deteccion", (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0,255,255), 2)
+                    return av.VideoFrame.from_ndarray(img, format="bgr24")
+                
+                # Escalar coordenadas si se redimensionó
+                scale_x = img.shape[1] / img_small.shape[1]
+                scale_y = img.shape[0] / img_small.shape[0]
+                raw_scaled = [(p[0] * scale_x, p[1] * scale_y, p[2]) for p in raw]
+                
+                pose = self.analizador.filtrar_confianza(raw_scaled)
+                estado, color, met = self.analizador.analizar_estado(
+                    pose, 
+                    (u_suelo, u_cojera, u_reposo, u_sentado, u_juego, 6)
+                )
+                
+                # Actualizar estado global
+                with self.lock:
+                    st.session_state.estado_actual = estado
+                    st.session_state.metricas_actuales = met
+                    st.session_state.pose_actual = pose
+                
+                # Renderizado
+                cv2.rectangle(img, (10,10), (550,90), (0,0,0), -1)
+                cv2.putText(img, estado, (25,55), cv2.FONT_HERSHEY_SIMPLEX, 1, color, 3)
+                
+                # Dibujar esqueleto
+                for c in self.esqueleto:
+                    if c[0] < len(pose) and c[1] < len(pose):
+                        p1, p2 = pose[c[0]], pose[c[1]]
+                        if p1[2] > conf_dlc and p2[2] > conf_dlc:
+                            cv2.line(img, (int(p1[0]), int(p1[1])), (int(p2[0]), int(p2[1])), (255,255,255), 2)
+                
+                # Dibujar puntos
+                for idx, p in enumerate(pose):
+                    if 0 <= p[0] < img.shape[1] and 0 <= p[1] < img.shape[0]:
+                        color_punto = (0,255,0) if p[2]>conf_dlc else (0,165,255)
+                        cv2.circle(img, (int(p[0]), int(p[1])), 5, color_punto, -1)
+                
+                # Mostrar info de debug
+                cv2.putText(img, f"Frame: {self.frame_count} | Puntos: {len(pose)}", (10, img.shape[0]-10), 
+                           cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255,255,255), 1)
                 
         except Exception as e:
-            error_msg = str(e)[:50]
+            error_msg = str(e)[:40]
             cv2.putText(img, f"Error: {error_msg}", (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0,0,255), 2)
-            print(f"Error en procesamiento: {e}")  # Para debug en consola
+            print(f"Error en procesamiento frame {self.frame_count}: {e}")
         
         return av.VideoFrame.from_ndarray(img, format="bgr24")
 
@@ -444,20 +456,33 @@ def run_video(path):
 
 # --- INTERFAZ PRINCIPAL ---
 if modo == "Cámara Live":
-    # Configuración RTC para mejor compatibilidad
+    # Configuración RTC mejorada con múltiples servidores STUN
     RTC_CONFIGURATION = RTCConfiguration(
-        {"iceServers": [{"urls": ["stun:stun.l.google.com:19302"]}]}
+        {"iceServers": [
+            {"urls": ["stun:stun.l.google.com:19302"]},
+            {"urls": ["stun:stun1.l.google.com:19302"]},
+            {"urls": ["stun:stun2.l.google.com:19302"]}
+        ]}
     )
     
     col_video, col_control = st.columns([1.5, 1])
     
     with col_video:
         st.markdown("### 🎥 Transmisión en Vivo")
+        st.info("⚠️ **Nota**: Permite el acceso a la cámara cuando el navegador lo solicite. La primera conexión puede tardar 10-15 segundos.")
+        
         webrtc_ctx = webrtc_streamer(
             key="cairo-monitor",
             video_processor_factory=CairoVideoProcessor,
             rtc_configuration=RTC_CONFIGURATION,
-            media_stream_constraints={"video": True, "audio": False},
+            media_stream_constraints={
+                "video": {
+                    "width": {"ideal": 640},
+                    "height": {"ideal": 480},
+                    "frameRate": {"ideal": 15, "max": 20}
+                }, 
+                "audio": False
+            },
             async_processing=True,
         )
     
@@ -466,7 +491,7 @@ if modo == "Cámara Live":
         st_met = st.empty()
         st_info = st.empty()
         
-        # Actualizar interfaz cada segundo
+        # Actualizar interfaz
         if webrtc_ctx.state.playing:
             estado = st.session_state.estado_actual
             met = st.session_state.metricas_actuales
