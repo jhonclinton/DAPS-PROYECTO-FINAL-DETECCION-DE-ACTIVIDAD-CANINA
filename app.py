@@ -11,6 +11,9 @@ from streamlit_webrtc import webrtc_streamer, VideoProcessorBase, RTCConfigurati
 import av
 import threading
 
+os.environ['CUDA_VISIBLE_DEVICES'] = '-1' # Desactiva GPU
+os.environ['TF_CPP_MIN_LOG_LEVEL'] = '3'  # Elimina avisos innecesarios
+os.environ['TF_FORCE_GPU_ALLOW_GROWTH'] = 'false'
 # --- CONFIGURACIÓN DE INTERFAZ ---
 st.set_page_config(page_title="Monitor Cairo AI - UNAP", layout="wide")
 
@@ -518,3 +521,4 @@ else:
                 run_video(video_path)
     else:
         st.info("👆 Sube un video para comenzar el análisis")
+
