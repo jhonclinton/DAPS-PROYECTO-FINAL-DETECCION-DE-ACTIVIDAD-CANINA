@@ -1,7 +1,7 @@
 streamlit
 opencv-python-headless
-numpy
+numpy<2.0.0
 tensorflow-cpu
-dlclive
+deeplabcut-live
 filterpy
 scipy
