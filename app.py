@@ -14,6 +14,7 @@ import threading
 os.environ['CUDA_VISIBLE_DEVICES'] = '-1' # Desactiva GPU
 os.environ['TF_CPP_MIN_LOG_LEVEL'] = '3'  # Elimina avisos innecesarios
 os.environ['TF_FORCE_GPU_ALLOW_GROWTH'] = 'false'
+
 # --- CONFIGURACIÓN DE INTERFAZ ---
 st.set_page_config(page_title="Monitor Cairo AI - UNAP", layout="wide")
 
@@ -250,19 +251,37 @@ if 'pose_actual' not in st.session_state:
 # --- CLASE VIDEO PROCESSOR PARA WEBRTC ---
 class CairoVideoProcessor(VideoProcessorBase):
     def __init__(self):
-        self.analizador = AnalizadorBiomecanicoCairo(confidence_threshold=conf_dlc)
+        self.modelo = modelo_ai
+        self.analizador = None
         self.esqueleto = [(0,2),(2,3),(3,4),(2,5),(5,6),(6,7),(2,8),(8,9),(9,10),(3,11),(11,12),(12,13),(3,14),(14,15),(15,16)]
         self.lock = threading.Lock()
+        self.frame_count = 0
         
     def recv(self, frame):
         img = frame.to_ndarray(format="bgr24")
         
-        if modelo_ai is None:
+        # Inicializar analizador en el primer frame
+        if self.analizador is None:
+            self.analizador = AnalizadorBiomecanicoCairo(confidence_threshold=conf_dlc)
+        
+        if self.modelo is None:
+            cv2.putText(img, "Modelo no cargado", (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 1, (0,0,255), 2)
             return av.VideoFrame.from_ndarray(img, format="bgr24")
         
+        self.frame_count += 1
+        
         try:
+            # Convertir imagen a RGB para DLC
+            img_rgb = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
+            
             # Inferencia
-            raw = modelo_ai.get_pose(img)
+            raw = self.modelo.get_pose(img_rgb)
+            
+            # Verificar que raw tenga datos válidos
+            if raw is None or len(raw) == 0:
+                cv2.putText(img, "Sin deteccion", (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0,255,255), 2)
+                return av.VideoFrame.from_ndarray(img, format="bgr24")
+            
             pose = self.analizador.filtrar_confianza(raw)
             estado, color, met = self.analizador.analizar_estado(
                 pose, 
@@ -279,14 +298,26 @@ class CairoVideoProcessor(VideoProcessorBase):
             cv2.rectangle(img, (10,10), (550,90), (0,0,0), -1)
             cv2.putText(img, estado, (25,55), cv2.FONT_HERSHEY_SIMPLEX, 1, color, 3)
             
+            # Dibujar esqueleto
             for c in self.esqueleto:
-                p1, p2 = pose[c[0]], pose[c[1]]
-                cv2.line(img, (int(p1[0]), int(p1[1])), (int(p2[0]), int(p2[1])), (255,255,255), 2)
-            for p in pose:
-                cv2.circle(img, (int(p[0]), int(p[1])), 5, (0,255,0) if p[2]>conf_dlc else (0,165,255), -1)
+                if c[0] < len(pose) and c[1] < len(pose):
+                    p1, p2 = pose[c[0]], pose[c[1]]
+                    if p1[2] > conf_dlc and p2[2] > conf_dlc:  # Solo dibujar si ambos puntos tienen buena confianza
+                        cv2.line(img, (int(p1[0]), int(p1[1])), (int(p2[0]), int(p2[1])), (255,255,255), 2)
+            
+            # Dibujar puntos
+            for idx, p in enumerate(pose):
+                if 0 <= p[0] < img.shape[1] and 0 <= p[1] < img.shape[0]:  # Verificar que esté dentro de la imagen
+                    color_punto = (0,255,0) if p[2]>conf_dlc else (0,165,255)
+                    cv2.circle(img, (int(p[0]), int(p[1])), 5, color_punto, -1)
+            
+            # Mostrar FPS
+            cv2.putText(img, f"Frame: {self.frame_count}", (10, img.shape[0]-10), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255,255,255), 1)
                 
         except Exception as e:
-            cv2.putText(img, f"Error: {str(e)[:30]}", (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0,0,255), 2)
+            error_msg = str(e)[:50]
+            cv2.putText(img, f"Error: {error_msg}", (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0,0,255), 2)
+            print(f"Error en procesamiento: {e}")  # Para debug en consola
         
         return av.VideoFrame.from_ndarray(img, format="bgr24")
 
@@ -521,4 +552,3 @@ else:
                 run_video(video_path)
     else:
         st.info("👆 Sube un video para comenzar el análisis")
-
